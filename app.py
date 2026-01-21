@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.exc import IntegrityError, DBAPIError
 
 # -----------------------------------------------------------------------------
 # STREAMLIT CONFIG
@@ -69,24 +70,48 @@ STATUS_LABELS = {
 # -----------------------------------------------------------------------------
 
 PRIORITY_BUCKETS = [
-    ("ar40", "AR40 - No order since 40+ days"),
-    ("ar28", "AR28 - No order since 28+ days (excluding AR40)"),
-    ("ar14", "AR14 - No order since 14+ days (excluding AR40/AR28)"),
-    ("ar7", "AR7 - No order since 7+ days (excluding AR40/AR28/AR14)"),
-    ("emerging_power_user", "Emerging Power User - 2 orders in last 8 days (proxy)"),
+    ("ar40", "AR40"),
+    ("ar28", "AR28"),
+    ("ar14", "AR14"),
+    ("ar7", "AR7"),
+    ("emerging_power_user", "Emerging Power User"),
     ("regular_activation", "Regular Activation"),
 ]
 
 PRIORITY_LABEL_BY_KEY = {k: v for k, v in PRIORITY_BUCKETS}
 
 PRIORITY_COLOR_BY_KEY = {
-    "ar40": "#e53935",               # red
-    "ar28": "#fb8c00",               # orange
-    "ar14": "#fbc02d",               # amber
-    "ar7": "#fdd835",                # yellow
-    "emerging_power_user": "#43a047",# green
-    "regular_activation": "#9e9e9e", # grey
+    "ar40": "#e53935",                # red
+    "ar28": "#fb8c00",                # orange
+    "ar14": "#fbc02d",                # amber
+    "ar7": "#fdd835",                 # yellow
+    "emerging_power_user": "#43a047", # green
+    "regular_activation": "#9e9e9e",  # grey
 }
+
+# -----------------------------------------------------------------------------
+# PARTNER TYPE TAG (NEW)
+# -----------------------------------------------------------------------------
+
+PARTNER_TYPE_TAG_OPTIONS = ["Portfolio", "Longtail"]  # stored in partner.partner_type_tag
+
+# -----------------------------------------------------------------------------
+# SESSION KEYS
+# -----------------------------------------------------------------------------
+
+FEEDBACK_FORM_URL = "https://forms.gle/4QpWEUAdxPobT636A"
+
+
+def ensure_session():
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if "current_user" not in st.session_state:
+        st.session_state.current_user = None
+    if "show_portfolio" not in st.session_state:
+        st.session_state.show_portfolio = False
+    if "show_feedback_dialog" not in st.session_state:
+        st.session_state.show_feedback_dialog = False
+
 
 # -----------------------------------------------------------------------------
 # DB HELPERS
@@ -125,16 +150,31 @@ def ensure_workitem_columns():
         conn.commit()
 
 
+def ensure_partner_type_tag_column():
+    """
+    Ensure partner.partner_type_tag exists (Portfolio / Longtail).
+    Kept permissive: doesn't force check constraint (you can add in Supabase manually).
+    """
+    q = text(
+        """
+        ALTER TABLE public.partner
+          ADD COLUMN IF NOT EXISTS partner_type_tag TEXT;
+        """
+    )
+    with get_connection() as conn:
+        conn.execute(q)
+        conn.commit()
+
+
 # -----------------------------------------------------------------------------
-# BOARD INIT / REFRESH (FIXED FOR UNIQUE(partner_id, work_date))
+# BOARD INIT / REFRESH
 # -----------------------------------------------------------------------------
 
 def ensure_today_rows_for_agent(agent_id: str) -> int:
     """
-    Safe under uniq_active_work_item_partner (partner_id) WHERE is_active=TRUE:
-    - Insert missing TODAY rows as is_active=FALSE (won't violate unique active)
-    - Deactivate any currently active rows for these partners (any date, including today)
-    - Activate TODAY rows
+    Ensures exactly one row per (partner_id, work_date=today) exists for the agent's partners,
+    and sets today's rows active.
+    Works even if you also have uniq_active_work_item_partner(partner_id) WHERE is_active=true.
     """
     q_insert_missing_today_inactive = text(
         """
@@ -185,11 +225,9 @@ def ensure_today_rows_for_agent(agent_id: str) -> int:
         return int(res.rowcount or 0)
 
 
-
-
 def refresh_board_for_agent(agent_id: str) -> int:
     """
-    Refresh today without violating uniq_active_work_item_partner:
+    Refresh today:
     - Insert missing TODAY rows as inactive
     - Deactivate any active rows for these partners
     - Reset TODAY status to to_call, set refreshed_at, activate TODAY
@@ -245,7 +283,6 @@ def refresh_board_for_agent(agent_id: str) -> int:
         return int(res.rowcount or 0)
 
 
-
 # -----------------------------------------------------------------------------
 # DATA FETCH
 # -----------------------------------------------------------------------------
@@ -264,6 +301,15 @@ def fetch_central_farmers() -> pd.DataFrame:
 
 
 def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
+    """
+    Priority rules (exclusive, in order):
+    - Emerging Power User: >=2 orders in last 8 days (proxy using MTD orders + recent activity)
+    - AR40: last activity >= 40 days ago
+    - AR28: last activity >= 28 days ago
+    - AR14: last activity >= 14 days ago
+    - AR7 : last activity >= 7 days ago
+    - else Regular Activation
+    """
     q = text(
         """
         WITH base AS (
@@ -279,6 +325,7 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
 
             p.external_partner_id,
             p.partner_name,
+            p.partner_type_tag,   -- NEW
             p.city,
             p.partner_type,
             p.handover_status,
@@ -289,12 +336,21 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
 
             lam.last_active_month,
 
-            -- ✅ robust activity date:
-            -- prefer last_order_date, else approximate from last_active_month as month-end
             COALESCE(
               p.last_order_date::date,
               (lam.last_active_month + interval '1 month - 1 day')::date
-            ) AS last_activity_date
+            ) AS last_activity_date,
+
+            CASE
+              WHEN COALESCE(
+                p.last_order_date::date,
+                (lam.last_active_month + interval '1 month - 1 day')::date
+              ) IS NULL THEN NULL
+              ELSE (CURRENT_DATE::date - COALESCE(
+                p.last_order_date::date,
+                (lam.last_active_month + interval '1 month - 1 day')::date
+              ))::int
+            END AS days_since_last_activity
 
           FROM work_item wi
           JOIN partner p ON p.id = wi.partner_id
@@ -317,40 +373,26 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
         SELECT
           *,
           CASE
-            -- Emerging Power User (proxy; depends on last_activity_date + MTD orders)
-            WHEN last_activity_date IS NOT NULL
-              AND last_activity_date >= (CURRENT_DATE - interval '8 days')::date
+            WHEN days_since_last_activity IS NOT NULL
+              AND days_since_last_activity <= 8
               AND orders_m0 >= 2
               THEN 'emerging_power_user'
-
-            WHEN last_activity_date IS NOT NULL
-              AND last_activity_date <= (CURRENT_DATE - interval '40 days')::date
-              THEN 'ar40'
-
-            WHEN last_activity_date IS NOT NULL
-              AND last_activity_date <= (CURRENT_DATE - interval '28 days')::date
-              THEN 'ar28'
-
-            WHEN last_activity_date IS NOT NULL
-              AND last_activity_date <= (CURRENT_DATE - interval '14 days')::date
-              THEN 'ar14'
-
-            WHEN last_activity_date IS NOT NULL
-              AND last_activity_date <= (CURRENT_DATE - interval '7 days')::date
-              THEN 'ar7'
-
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 40 THEN 'ar40'
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 28 THEN 'ar28'
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 14 THEN 'ar14'
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 7  THEN 'ar7'
             ELSE 'regular_activation'
           END AS priority_bucket_key,
 
           CASE
-            WHEN last_activity_date IS NOT NULL
-              AND last_activity_date >= (CURRENT_DATE - interval '8 days')::date
+            WHEN days_since_last_activity IS NOT NULL
+              AND days_since_last_activity <= 8
               AND orders_m0 >= 2
               THEN 50
-            WHEN last_activity_date IS NOT NULL AND last_activity_date <= (CURRENT_DATE - interval '40 days')::date THEN 10
-            WHEN last_activity_date IS NOT NULL AND last_activity_date <= (CURRENT_DATE - interval '28 days')::date THEN 20
-            WHEN last_activity_date IS NOT NULL AND last_activity_date <= (CURRENT_DATE - interval '14 days')::date THEN 30
-            WHEN last_activity_date IS NOT NULL AND last_activity_date <= (CURRENT_DATE - interval '7 days')::date  THEN 40
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 40 THEN 10
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 28 THEN 20
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 14 THEN 30
+            WHEN days_since_last_activity IS NOT NULL AND days_since_last_activity >= 7  THEN 40
             ELSE 60
           END AS priority_bucket_rank
 
@@ -358,7 +400,7 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
         ORDER BY
           priority_bucket_rank ASC,
           rev_m0 DESC,
-          last_activity_date ASC NULLS LAST,
+          days_since_last_activity DESC NULLS LAST,
           partner_name;
         """
     )
@@ -376,9 +418,24 @@ def update_work_item_status(work_item_id: str, new_status: str) -> None:
         WHERE id = :id;
         """
     )
-    with get_connection() as conn:
-        conn.execute(q, {"status": new_status, "id": work_item_id})
-        conn.commit()
+
+    try:
+        with get_connection() as conn:
+            res = conn.execute(q, {"status": new_status, "id": work_item_id})
+            conn.commit()
+
+            if hasattr(res, "rowcount") and res.rowcount == 0:
+                st.error(f"No work_item found for id={work_item_id}. Data may be stale; refresh the page.")
+                st.stop()
+
+    except IntegrityError as e:
+        st.error("DB integrity error while updating status.")
+        st.exception(e)
+        st.stop()
+    except DBAPIError as e:
+        st.error("DB error while updating status.")
+        st.exception(e)
+        st.stop()
 
 
 def get_user_portfolio(agent_email: str) -> pd.DataFrame:
@@ -387,6 +444,7 @@ def get_user_portfolio(agent_email: str) -> pd.DataFrame:
         SELECT
             p.external_partner_id,
             p.partner_name,
+            p.partner_type_tag,
             p.city,
             p.partner_type,
             COALESCE(last_m.net_revenue, 0) AS last_month_revenue,
@@ -411,31 +469,10 @@ def get_user_portfolio(agent_email: str) -> pd.DataFrame:
 
 
 # -----------------------------------------------------------------------------
-# SESSION KEYS
-# -----------------------------------------------------------------------------
-
-FEEDBACK_FORM_URL = "https://forms.gle/4QpWEUAdxPobT636A"
-
-def ensure_session():
-    if "logged_in" not in st.session_state:
-        st.session_state.logged_in = False
-    if "current_user" not in st.session_state:
-        st.session_state.current_user = None
-    if "show_portfolio" not in st.session_state:
-        st.session_state.show_portfolio = False
-    if "show_feedback_dialog" not in st.session_state:
-        st.session_state.show_feedback_dialog = False
-
-
-# -----------------------------------------------------------------------------
 # FEEDBACK DIALOG
 # -----------------------------------------------------------------------------
 
 def render_feedback_dialog():
-    """
-    Show a dialog after status update. Uses st.dialog if available.
-    The link opens in a new tab via link_button (if available).
-    """
     if not st.session_state.get("show_feedback_dialog"):
         return
 
@@ -443,27 +480,24 @@ def render_feedback_dialog():
         st.session_state.show_feedback_dialog = False
         st.rerun()
 
-    # Streamlit has st.dialog in newer versions; if not, we fallback to a bordered container.
     if hasattr(st, "dialog"):
         with st.dialog("Fill Feedback form"):
             st.write("Please fill feedback for the call.")
             if hasattr(st, "link_button"):
-                # Clicking this opens a new tab and triggers a click event in Streamlit
                 if st.link_button("Open feedback form", FEEDBACK_FORM_URL):
                     _close()
             else:
-                st.markdown(f"[Open feedback form]({FEEDBACK_FORM_URL})", unsafe_allow_html=False)
+                st.markdown(f"[Open feedback form]({FEEDBACK_FORM_URL})")
                 if st.button("Close"):
                     _close()
     else:
-        # Fallback (no modal)
         with st.container(border=True):
             st.subheader("Fill Feedback form")
             if hasattr(st, "link_button"):
                 if st.link_button("Open feedback form", FEEDBACK_FORM_URL):
                     _close()
             else:
-                st.markdown(f"[Open feedback form]({FEEDBACK_FORM_URL})", unsafe_allow_html=False)
+                st.markdown(f"[Open feedback form]({FEEDBACK_FORM_URL})")
                 if st.button("Close"):
                     _close()
 
@@ -481,20 +515,20 @@ def render_login():
         st.error("No central_farmers configured in app_user.")
         return
 
-    name_map = {row["name"]: row for _, row in farmers_df.iterrows()}
+    name_map = {r["name"]: r for _, r in farmers_df.iterrows()}
     selected_name = st.selectbox("User", list(name_map.keys()))
 
     if selected_name:
-        row = name_map[selected_name]
-        st.write(f"Email: `{row['email']}` | Role: `{row['role']}`")
+        r = name_map[selected_name]
+        st.write(f"Email: `{r['email']}` | Role: `{r['role']}`")
 
     if st.button("Log In"):
-        user_row = name_map[selected_name]
+        r = name_map[selected_name]
         st.session_state.current_user = {
-            "id": user_row["id"],
-            "name": user_row["name"],
-            "email": user_row["email"],
-            "role": user_row["role"],
+            "id": r["id"],
+            "name": r["name"],
+            "email": r["email"],
+            "role": r["role"],
         }
         st.session_state.logged_in = True
         st.session_state.show_portfolio = False
@@ -502,72 +536,52 @@ def render_login():
 
 
 # -----------------------------------------------------------------------------
-# KANBAN CARD
+# KANBAN CARD (FIXED: all 'row' usage is inside this function)
 # -----------------------------------------------------------------------------
 
+def _fmt_dt(val) -> str:
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return "-"
+    try:
+        return str(val)[:19].replace("T", " ")
+    except Exception:
+        return str(val)
+
+
 def render_account_card(row):
-    bucket_key = row.get("priority_bucket_key", "")
-    bucket_label = PRIORITY_LABEL_BY_KEY.get(bucket_key, bucket_key or "-")
+    bucket_key = row.get("priority_bucket_key", "regular_activation")
+    bucket_label = PRIORITY_LABEL_BY_KEY.get(bucket_key, bucket_key)
     bucket_color = PRIORITY_COLOR_BY_KEY.get(bucket_key, "#616161")
 
-    CATEGORY_LABEL_MAP = {
-        "ar40": "AR40",
-        "ar28": "AR28",
-        "ar14": "AR14",
-        "ar7": "AR7",
-        "emerging_power_user": "Emerging Power User",
-        "regular_activation": "Regular Activation",
-    }
-    category_label = CATEGORY_LABEL_MAP.get(bucket_key, bucket_key.upper() if bucket_key else "-")
+    ext_id = str(row.get("external_partner_id") or "").strip()
+    oms_url = f"https://oms.orangehealth.in/partner/{ext_id}" if ext_id else None
 
-    ext_id = row.get("external_partner_id", "-")
-    oms_url = f"https://oms.orangehealth.in/partner/{ext_id}"
+    created_at = _fmt_dt(row.get("created_at"))
+    refreshed_at = _fmt_dt(row.get("refreshed_at"))
 
-    created_at = row.get("created_at")
-    refreshed_at = row.get("refreshed_at")
-
+    # Card UI: only name, external id, bucket, OMS link, first added, last refresh
     st.markdown(
         f"""
         <div style="border-left: 6px solid {bucket_color}; padding-left: 10px;">
-          <div style="display:flex; justify-content:space-between; align-items:center;">
-            <div style="font-size: 16px; font-weight: 700;">
-              {row['partner_name']}
-            </div>
-            <div style="
-                background:{bucket_color};
-                color:white;
-                padding:4px 8px;
-                border-radius:6px;
-                font-size:12px;
-                font-weight:700;">
-              {category_label}
-            </div>
+          <div style="font-size: 16px; font-weight: 700;">{row.get('partner_name','-')}</div>
+          <div style="margin-top:2px;">
+            <span style="font-weight:600;">External ID:</span>
+            <code>{ext_id or '-'}</code>
           </div>
-
-          <div style="margin-top:4px;">
-            External ID: <code>{ext_id}</code>
-          </div>
-
-          <div style="margin-top:6px;">
-            Priority Bucket:
-            <span style="color:{bucket_color}; font-weight:700;">
-              {bucket_label}
-            </span>
-          </div>
-
-          <div style="margin-top:6px;">
-            <a href="{oms_url}" target="_blank" rel="noopener noreferrer">
-              OMS Link: {oms_url}
-            </a>
-          </div>
-
-          <div style="font-size: 12px; opacity: 0.75; margin-top:6px;">
-            First Added: <code>{created_at or '-'}</code>
-            &nbsp;|&nbsp;
-            Last Refresh: <code>{refreshed_at or '-'}</code>
+          <div style="margin-top:2px;">
+            <span style="font-weight:600;">Category:</span>
+            <span style="color:{bucket_color}; font-weight:800;">{bucket_label}</span>
           </div>
         </div>
-        """,
+        """.strip(),
+        unsafe_allow_html=True,
+    )
+
+    if oms_url:
+        st.markdown(f"[OMS Link: {oms_url}]({oms_url})")
+
+    st.markdown(
+        f"<div style='font-size:12px; opacity:0.8;'>First Added: <code>{created_at}</code> · Last Refresh: <code>{refreshed_at}</code></div>",
         unsafe_allow_html=True,
     )
 
@@ -580,10 +594,12 @@ def render_account_card(row):
         label_visibility="collapsed",
     )
 
-    if new_status != current_status:
-        update_work_item_status(row["work_item_id"], new_status)
-        st.session_state.show_feedback_dialog = True
-        st.rerun()
+    if st.button("Update Status", key=f"btn_update_{row['work_item_id']}"):
+        if new_status != current_status:
+            update_work_item_status(row["work_item_id"], new_status)
+            st.session_state.show_feedback_dialog = True
+            st.rerun()
+
 
 # -----------------------------------------------------------------------------
 # KANBAN BOARD
@@ -594,15 +610,16 @@ def render_board():
     st.markdown("### Accounts to be Worked")
     st.caption(f"Logged in as **{user['name']}** (`{user['email']}` · {user['role']})")
 
-    # Ensure required columns exist
+    # Ensure required DB columns exist
     try:
         ensure_workitem_columns()
+        ensure_partner_type_tag_column()
     except Exception as e:
-        st.error("Could not ensure required columns exist on `work_item`.")
+        st.error("Could not ensure required columns exist on DB.")
         st.caption(f"DB message: {e}")
         return
 
-    # Ensure today's rows exist (one per partner per day)
+    # Ensure today's rows exist
     inserted = ensure_today_rows_for_agent(user["id"])
     if inserted > 0:
         st.success(f"Added {inserted} missing work item(s) to today’s board.")
@@ -629,15 +646,15 @@ def render_board():
         return
 
     # -----------------------------
-    # GLOBAL FILTERS
+    # GLOBAL FILTERS (incl partner type tag)
     # -----------------------------
     st.markdown("#### Filters")
-    f1, f2 = st.columns([1, 1])
+    f1, f2, f3 = st.columns([1, 1, 1])
 
     with f1:
         bucket_options = [k for k, _ in PRIORITY_BUCKETS]
         selected_buckets = st.multiselect(
-            "Priority Bucket",
+            "Category",
             options=bucket_options,
             default=[],
             format_func=lambda k: PRIORITY_LABEL_BY_KEY.get(k, k),
@@ -645,6 +662,15 @@ def render_board():
         )
 
     with f2:
+        partner_type_tag_filter = st.multiselect(
+            "Partner Type",
+            options=PARTNER_TYPE_TAG_OPTIONS,
+            default=[],
+            key="filter_partner_type_tag",
+            help="Portfolio / Longtail",
+        )
+
+    with f3:
         external_id_search = st.text_input(
             "External Partner ID (search)",
             value="",
@@ -656,6 +682,10 @@ def render_board():
 
     if selected_buckets:
         filtered_df = filtered_df[filtered_df["priority_bucket_key"].isin(selected_buckets)]
+
+    if partner_type_tag_filter:
+        # partner_type_tag can be null for older partners; those will be excluded unless you select none
+        filtered_df = filtered_df[filtered_df["partner_type_tag"].isin(partner_type_tag_filter)]
 
     if external_id_search and external_id_search.strip():
         s = external_id_search.strip().lower()
@@ -680,12 +710,11 @@ def render_board():
                     with st.container(border=True):
                         render_account_card(r)
 
-    # Render feedback dialog at end of board render so it pops up after rerun
     render_feedback_dialog()
 
 
 # -----------------------------------------------------------------------------
-# UPLOAD DATA (UNCHANGED: note monthly upload DOES NOT auto-map partners)
+# UPLOAD DATA
 # -----------------------------------------------------------------------------
 
 def _normalize_partner_type(val: str) -> str:
@@ -701,6 +730,17 @@ def _normalize_partner_type(val: str) -> str:
     return str(val).strip()
 
 
+def _normalize_partner_type_tag(val):
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    s = str(val).strip().lower()
+    if s in {"portfolio", "p"}:
+        return "Portfolio"
+    if s in {"longtail", "long tail", "lt", "l"}:
+        return "Longtail"
+    return None
+
+
 def render_upload_tab():
     st.markdown("### Upload Data")
 
@@ -710,9 +750,9 @@ def render_upload_tab():
     st.subheader("Upload Monthly Metrics (CSV)")
     st.caption(
         "Upload monthly performance sheet for partners. "
-        "Selected month will be saved into `partner_monthly_metrics.month_date` "
-        "as the first day of that month. Missing partners will be auto-created.\n\n"
-        "Note: This does NOT auto-map partners to your agent. Use the mapping upload below for that."
+        "Selected month will be saved into `partner_monthly_metrics.month_date` as the first day of that month. "
+        "Missing partners will be auto-created.\n\n"
+        "Optional: include a column `Type` (Portfolio/Longtail) to set partner type tag."
     )
 
     today = date.today()
@@ -750,6 +790,10 @@ def render_upload_tab():
                     "Rev/GMV": "rev_per_gmv",
                     "Channel Share": "channel_share",
                     "Active Days": "active_days",
+                    # NEW possible columns for tag
+                    "Type": "partner_type_tag",
+                    "Partner Segment": "partner_type_tag",
+                    "Partner Tag": "partner_type_tag",
                 }
             )
 
@@ -760,6 +804,9 @@ def render_upload_tab():
                 for c in numeric_cols:
                     if c in df.columns:
                         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+
+                if "partner_type_tag" in df.columns:
+                    df["partner_type_tag"] = df["partner_type_tag"].apply(_normalize_partner_type_tag)
 
                 if st.button("Upload & Save Monthly Metrics", key="btn_upload_metrics"):
                     partner_upserts = 0
@@ -780,6 +827,7 @@ def render_upload_tab():
                                 "bd_cat": row.get("bd_cat"),
                                 "partner_type": row.get("partner_type"),
                                 "price_list": row.get("price_list"),
+                                "partner_type_tag": row.get("partner_type_tag"),
                             }
 
                             try:
@@ -794,6 +842,7 @@ def render_upload_tab():
                                             bd_cat,
                                             partner_type,
                                             price_list,
+                                            partner_type_tag,
                                             updated_at
                                         )
                                         VALUES (
@@ -804,16 +853,18 @@ def render_upload_tab():
                                             :bd_cat,
                                             :partner_type,
                                             :price_list,
+                                            :partner_type_tag,
                                             NOW()
                                         )
                                         ON CONFLICT (external_partner_id) DO UPDATE SET
-                                            partner_name = EXCLUDED.partner_name,
-                                            city         = EXCLUDED.city,
-                                            partner_bd   = EXCLUDED.partner_bd,
-                                            bd_cat       = EXCLUDED.bd_cat,
-                                            partner_type = EXCLUDED.partner_type,
-                                            price_list   = EXCLUDED.price_list,
-                                            updated_at   = NOW()
+                                            partner_name      = EXCLUDED.partner_name,
+                                            city              = EXCLUDED.city,
+                                            partner_bd        = EXCLUDED.partner_bd,
+                                            bd_cat            = EXCLUDED.bd_cat,
+                                            partner_type      = EXCLUDED.partner_type,
+                                            price_list        = EXCLUDED.price_list,
+                                            partner_type_tag  = COALESCE(EXCLUDED.partner_type_tag, partner.partner_type_tag),
+                                            updated_at        = NOW()
                                         RETURNING id;
                                         """
                                     ),
@@ -875,9 +926,7 @@ def render_upload_tab():
 
                             except Exception as e:
                                 conn.rollback()
-                                error_rows.append(
-                                    {"row_index": int(idx), "external_partner_id": external_id, "error": str(e)}
-                                )
+                                error_rows.append({"row_index": int(idx), "external_partner_id": external_id, "error": str(e)})
 
                     if metric_upserts > 0:
                         st.success(
@@ -896,8 +945,8 @@ def render_upload_tab():
     # -------------------------------
     st.subheader("Add / Map Partners to My Account (CSV)")
     st.caption(
-        "Use this when partners are mapped to you but have no mapping yet. "
-        "We will (1) upsert into `partner` by external_partner_id, then (2) create mapping in `partner_agent_map`."
+        "We will (1) upsert into `partner` by external_partner_id, then (2) create mapping in `partner_agent_map`.\n\n"
+        "Optional: include column `Type` (Portfolio/Longtail) to set partner type tag."
     )
 
     st.markdown(
@@ -909,6 +958,7 @@ def render_upload_tab():
         - `Phone Num`
         - `Partner Type` (at_home / in_clinic / eclinic or similar)
         - `Wallet Amount`
+        - `Type` (Portfolio/Longtail) [optional]
         """
     )
 
@@ -933,6 +983,9 @@ def render_upload_tab():
             "Partner Type": "partner_type",
             "Wallet Amount": "wallet_amount",
             "City": "city",
+            "Type": "partner_type_tag",
+            "Partner Segment": "partner_type_tag",
+            "Partner Tag": "partner_type_tag",
         }
     )
 
@@ -948,6 +1001,9 @@ def render_upload_tab():
 
     if "wallet_amount" in p_df.columns:
         p_df["wallet_amount"] = pd.to_numeric(p_df["wallet_amount"], errors="coerce").fillna(0)
+
+    if "partner_type_tag" in p_df.columns:
+        p_df["partner_type_tag"] = p_df["partner_type_tag"].apply(_normalize_partner_type_tag)
 
     if st.button("Add / Map Partners to My Account", key="btn_add_map_partners"):
         user = st.session_state.current_user
@@ -972,6 +1028,7 @@ def render_upload_tab():
                           phone,
                           partner_type,
                           wallet_amount,
+                          partner_type_tag,
                           updated_at
                         )
                         VALUES (
@@ -981,15 +1038,17 @@ def render_upload_tab():
                           :phone,
                           :partner_type,
                           :wallet_amount,
+                          :partner_type_tag,
                           NOW()
                         )
                         ON CONFLICT (external_partner_id) DO UPDATE SET
-                          partner_name = EXCLUDED.partner_name,
-                          city         = EXCLUDED.city,
-                          phone        = EXCLUDED.phone,
-                          partner_type = EXCLUDED.partner_type,
-                          wallet_amount= EXCLUDED.wallet_amount,
-                          updated_at   = NOW()
+                          partner_name      = EXCLUDED.partner_name,
+                          city              = EXCLUDED.city,
+                          phone             = EXCLUDED.phone,
+                          partner_type      = EXCLUDED.partner_type,
+                          wallet_amount     = EXCLUDED.wallet_amount,
+                          partner_type_tag  = COALESCE(EXCLUDED.partner_type_tag, partner.partner_type_tag),
+                          updated_at        = NOW()
                         RETURNING id;
                         """
                     )
@@ -1001,6 +1060,7 @@ def render_upload_tab():
                         "phone": r.get("phone"),
                         "partner_type": r.get("partner_type"),
                         "wallet_amount": float(r.get("wallet_amount", 0)),
+                        "partner_type_tag": r.get("partner_type_tag"),
                     }
 
                     partner_id = conn.execute(partner_sql, partner_params).scalar()
