@@ -64,6 +64,9 @@ STATUS_LABELS = {
     "successful_call": "Successful Call",
     "escalated": "Escalated",
 }
+RNR_STATUSES = {"rnr_1", "rnr_2", "rnr_final"}
+CALL_STATUS_OPTIONS = ["Connected", "Switched OFF", "RNR"]
+
 
 # -----------------------------------------------------------------------------
 # PRIORITY BUCKETS (UPDATED)
@@ -111,6 +114,39 @@ def ensure_session():
         st.session_state.show_portfolio = False
     if "show_feedback_dialog" not in st.session_state:
         st.session_state.show_feedback_dialog = False
+    if "pending_status_payload" not in st.session_state:
+        st.session_state.pending_status_payload = None
+    if "open_status_dialog" not in st.session_state:
+        st.session_state.open_status_dialog = False
+
+
+def on_status_change(work_item_id: str):
+    work_item_id = str(work_item_id)
+
+    row = st.session_state.get("_row_lookup", {}).get(work_item_id)
+    if not row:
+        return  # safe no-op
+
+    selected_status = st.session_state.get(f"status_select_{work_item_id}")
+    if not selected_status:
+        return
+
+    # If status didn't actually change, do nothing
+    if selected_status == row.get("status"):
+        return
+
+    st.session_state.pending_status_payload = {
+        "work_item_id": work_item_id,
+        "partner_id": str(row.get("partner_id")),
+        "external_partner_id": row.get("external_partner_id"),
+        "partner_name": row.get("partner_name"),
+        "agent_id": st.session_state.current_user["id"],
+        "agent_name": st.session_state.current_user["name"],
+        "status": selected_status,
+    }
+    st.session_state.open_status_dialog = True
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -165,120 +201,49 @@ def ensure_partner_type_tag_column():
         conn.execute(q)
         conn.commit()
 
-
-# -----------------------------------------------------------------------------
-# BOARD INIT / REFRESH
-# -----------------------------------------------------------------------------
-
-def ensure_today_rows_for_agent(agent_id: str) -> int:
-    """
-    Ensures exactly one row per (partner_id, work_date=today) exists for the agent's partners,
-    and sets today's rows active.
-    Works even if you also have uniq_active_work_item_partner(partner_id) WHERE is_active=true.
-    """
-    q_insert_missing_today_inactive = text(
-        """
-        INSERT INTO work_item (partner_id, work_date, status, is_active, updated_at, created_at)
-        SELECT pam.partner_id, CURRENT_DATE::date, 'to_call', FALSE, NOW(), NOW()
-        FROM partner_agent_map pam
-        LEFT JOIN work_item wi
-          ON wi.partner_id = pam.partner_id
-         AND wi.work_date  = CURRENT_DATE::date
-        WHERE pam.agent_id = :agent_id
-          AND wi.id IS NULL;
-        """
-    )
-
-    q_deactivate_any_active = text(
-        """
-        UPDATE work_item wi
-        SET is_active = FALSE,
-            updated_at = NOW()
-        WHERE wi.is_active = TRUE
-          AND wi.partner_id IN (
-            SELECT partner_id
-            FROM partner_agent_map
-            WHERE agent_id = :agent_id
-          );
-        """
-    )
-
-    q_activate_today = text(
-        """
-        UPDATE work_item wi
-        SET is_active = TRUE,
-            updated_at = NOW()
-        WHERE wi.work_date = CURRENT_DATE::date
-          AND wi.partner_id IN (
-            SELECT partner_id
-            FROM partner_agent_map
-            WHERE agent_id = :agent_id
-          );
-        """
-    )
-
+def ensure_activity_log_table():
+    q = text("""
+    CREATE TABLE IF NOT EXISTS work_item_activity_log (
+        id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+        work_item_id UUID NOT NULL,
+        partner_id UUID NOT NULL,
+        external_partner_id TEXT,
+        partner_name TEXT,
+        agent_id UUID NOT NULL,
+        agent_name TEXT,
+        status TEXT NOT NULL,
+        doctor_sentiment TEXT,
+        primary_concern TEXT,
+        next_suggested_action TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW()
+    );
+    """)
     with get_connection() as conn:
-        res = conn.execute(q_insert_missing_today_inactive, {"agent_id": agent_id})
-        conn.execute(q_deactivate_any_active, {"agent_id": agent_id})
-        conn.execute(q_activate_today, {"agent_id": agent_id})
+        conn.execute(q)
         conn.commit()
-        return int(res.rowcount or 0)
 
-
-def refresh_board_for_agent(agent_id: str) -> int:
+def reset_work_items_for_agent(agent_id: str) -> int:
     """
-    Refresh today:
-    - Insert missing TODAY rows as inactive
-    - Deactivate any active rows for these partners
-    - Reset TODAY status to to_call, set refreshed_at, activate TODAY
+    Explicit manual reset:
+    - Sets all active work_items for this agent back to 'to_call'
+    - Does NOT create rows
+    - Does NOT change work_date
     """
-    q_insert_missing_today_inactive = text(
-        """
-        INSERT INTO work_item (partner_id, work_date, status, is_active, updated_at, created_at)
-        SELECT pam.partner_id, CURRENT_DATE::date, 'to_call', FALSE, NOW(), NOW()
-        FROM partner_agent_map pam
-        LEFT JOIN work_item wi
-          ON wi.partner_id = pam.partner_id
-         AND wi.work_date  = CURRENT_DATE::date
-        WHERE pam.agent_id = :agent_id
-          AND wi.id IS NULL;
-        """
-    )
-
-    q_deactivate_any_active = text(
-        """
-        UPDATE work_item wi
-        SET is_active = FALSE,
-            updated_at = NOW()
-        WHERE wi.is_active = TRUE
-          AND wi.partner_id IN (
-            SELECT partner_id
-            FROM partner_agent_map
-            WHERE agent_id = :agent_id
-          );
-        """
-    )
-
-    q_reset_today = text(
-        """
-        UPDATE work_item wi
+    q = text("""
+        UPDATE work_item
         SET status = 'to_call',
-            is_active = TRUE,
             refreshed_at = NOW(),
             updated_at = NOW()
-        WHERE wi.work_date = CURRENT_DATE::date
-          AND wi.partner_id IN (
-            SELECT partner_id
-            FROM partner_agent_map
-            WHERE agent_id = :agent_id
+        WHERE is_active = TRUE
+          AND partner_id IN (
+              SELECT partner_id
+              FROM partner_agent_map
+              WHERE agent_id = :agent_id
           );
-        """
-    )
+    """)
 
     with get_connection() as conn:
-        res = conn.execute(q_insert_missing_today_inactive, {"agent_id": agent_id})
-        conn.execute(q_deactivate_any_active, {"agent_id": agent_id})
-        conn.execute(q_reset_today, {"agent_id": agent_id})
+        res = conn.execute(q, {"agent_id": agent_id})
         conn.commit()
         return int(res.rowcount or 0)
 
@@ -333,7 +298,7 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
 
             COALESCE(pm0.orders, 0)      AS orders_m0,
             COALESCE(pm0.net_revenue, 0) AS rev_m0,
-
+            lf.follow_up_date AS latest_follow_up_date,
             lam.last_active_month,
 
             COALESCE(
@@ -359,6 +324,15 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
           LEFT JOIN partner_monthly_metrics pm0
             ON pm0.partner_id = p.id
            AND pm0.month_date = date_trunc('month', CURRENT_DATE)::date
+            LEFT JOIN LATERAL (
+                SELECT
+                    wal.follow_up_date
+                FROM work_item_activity_log wal
+                WHERE wal.work_item_id = wi.id
+                AND wal.follow_up_date IS NOT NULL
+                ORDER BY wal.created_at DESC
+                LIMIT 1
+            ) lf ON TRUE
 
           LEFT JOIN LATERAL (
             SELECT MAX(pm.month_date)::date AS last_active_month
@@ -368,7 +342,7 @@ def fetch_work_items_for_agent(agent_id: str) -> pd.DataFrame:
           ) lam ON TRUE
 
           WHERE pam.agent_id = :agent_id
-            AND wi.work_date = CURRENT_DATE::date
+            AND wi.is_active = TRUE
         )
         SELECT
           *,
@@ -477,7 +451,8 @@ def render_feedback_dialog():
         return
 
     def _close():
-        st.session_state.show_feedback_dialog = False
+        st.session_state.open_status_dialog = False
+        st.session_state.pending_status_payload = None
         st.rerun()
 
     if hasattr(st, "dialog"):
@@ -549,6 +524,7 @@ def _fmt_dt(val) -> str:
 
 
 def render_account_card(row):
+    latest_follow_up_date = row.get("latest_follow_up_date")
     bucket_key = row.get("priority_bucket_key", "regular_activation")
     bucket_label = PRIORITY_LABEL_BY_KEY.get(bucket_key, bucket_key)
     bucket_color = PRIORITY_COLOR_BY_KEY.get(bucket_key, "#616161")
@@ -576,6 +552,14 @@ def render_account_card(row):
         """.strip(),
         unsafe_allow_html=True,
     )
+    if row["status"] == "follow_up" and latest_follow_up_date:
+        st.markdown(
+            f"<div style='margin-top:6px; font-size:13px;'>"
+            f"🗓️ <b>Follow-up on:</b> "
+            f"<code>{latest_follow_up_date}</code>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
 
     if oms_url:
         st.markdown(f"[OMS Link: {oms_url}]({oms_url})")
@@ -584,21 +568,20 @@ def render_account_card(row):
         f"<div style='font-size:12px; opacity:0.8;'>First Added: <code>{created_at}</code> · Last Refresh: <code>{refreshed_at}</code></div>",
         unsafe_allow_html=True,
     )
-
+    wid = str(row["work_item_id"])
     current_status = row["status"]
     new_status = st.selectbox(
         "Move to...",
         STATUS_KEYS,
         index=STATUS_KEYS.index(current_status) if current_status in STATUS_KEYS else 0,
-        key=f"move_{row['work_item_id']}",
+        key=f"status_select_{wid}",
         label_visibility="collapsed",
+        on_change=on_status_change,
+        args=(wid,),
     )
 
-    if st.button("Update Status", key=f"btn_update_{row['work_item_id']}"):
-        if new_status != current_status:
-            update_work_item_status(row["work_item_id"], new_status)
-            st.session_state.show_feedback_dialog = True
-            st.rerun()
+
+
 
 
 # -----------------------------------------------------------------------------
@@ -619,31 +602,42 @@ def render_board():
         st.caption(f"DB message: {e}")
         return
 
-    # Ensure today's rows exist
-    inserted = ensure_today_rows_for_agent(user["id"])
-    if inserted > 0:
-        st.success(f"Added {inserted} missing work item(s) to today’s board.")
 
     c1, c2 = st.columns([1, 2], vertical_alignment="center")
     with c1:
         if st.button("🔄 Refresh board (reset all to To Call)"):
-            created = refresh_board_for_agent(user["id"])
+            updated = reset_work_items_for_agent(user["id"])
             st.success(
-                f"Refreshed today’s board. Inserted {created} new row(s) for partners that weren’t on today’s board yet; "
-                f"reset statuses to To Call for all."
+                 f"Reset {updated} account(s) back to 'To Call'. "
+                 "This does not affect priority or work dates."
             )
             st.rerun()
 
+
     with c2:
         st.caption(
-            "Board is daily: items are keyed by (partner_id, work_date = today). "
-            "Refresh resets today’s statuses; it won’t create duplicates for the same day."
+            "Board is persistent across days. "
+            "Refresh is a manual reset that sets all accounts back to 'To Call'. "
+            "Priority is recalculated automatically."
         )
+
 
     df = fetch_work_items_for_agent(user["id"])
     if df.empty:
         st.info("No work items found for today. Try Refresh.")
         return
+
+    df = df.copy()
+    df["work_item_id"] = df["work_item_id"].astype(str)
+    df["partner_id"] = df["partner_id"].astype(str)
+
+
+    # Used by status dropdown callback
+    st.session_state["_row_lookup"] = {
+        str(r["work_item_id"]): r.to_dict()
+        for _, r in df.iterrows()
+    }
+
 
     # -----------------------------
     # GLOBAL FILTERS (incl partner type tag)
@@ -696,7 +690,7 @@ def render_board():
     st.caption(f"Showing **{len(filtered_df)}** / {len(df)} accounts after filters.")
 
     status_counts = {s: int((filtered_df["status"] == s).sum()) for s in STATUS_KEYS}
-
+    render_status_update_dialog()
     cols = st.columns(len(STATUS_KEYS))
     for col, status in zip(cols, STATUS_KEYS):
         label = STATUS_LABELS.get(status, status)
@@ -709,9 +703,204 @@ def render_board():
                 for _, r in subset.iterrows():
                     with st.container(border=True):
                         render_account_card(r)
+    ensure_activity_log_table()
+    
 
-    render_feedback_dialog()
+# Feedback Popup
 
+def render_status_update_dialog():
+    if not st.session_state.get("open_status_dialog"):
+        return
+
+    payload = st.session_state.get("pending_status_payload")
+    if not payload or not isinstance(payload, dict):
+        st.session_state.open_status_dialog = False
+        st.session_state.pending_status_payload = None
+        return
+
+    def _close():
+        st.session_state.open_status_dialog = False
+        st.session_state.pending_status_payload = None
+        st.rerun()
+
+    def _save(call_status, sentiment, concern, next_action, follow_up_date):
+        persist_status_change({
+            **payload,
+            "call_status": call_status,
+            "doctor_sentiment": sentiment,
+            "primary_concern": concern,
+            "next_suggested_action": next_action,
+            "follow_up_date": follow_up_date,
+        })
+        _close()
+
+    # ----------------------------
+    # UI START (orange container)
+    # ----------------------------
+    with st.container(border=True):
+        st.markdown(
+            """
+            <style>
+            .feedback-box {
+                border: 2px solid #ff9800;
+                border-radius: 10px;
+                padding: 16px;
+            }
+            </style>
+            <div class="feedback-box">
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.subheader("📋 Call Feedback")
+
+        st.text_input("Partner ID", payload["external_partner_id"], disabled=True)
+        st.text_input("Doctor Name", payload["partner_name"], disabled=True)
+        st.text_input("Agent Name", payload["agent_name"], disabled=True)
+
+        # ----------------------------
+        # Call Status (NEW)
+        # ----------------------------
+        default_call_status = (
+            "RNR" if payload["status"] in RNR_STATUSES else None
+        )
+
+        call_status = st.selectbox(
+            "Call Status *",
+            CALL_STATUS_OPTIONS,
+            index=CALL_STATUS_OPTIONS.index(default_call_status)
+            if default_call_status in CALL_STATUS_OPTIONS
+            else 0,
+            key="dlg_call_status",
+        )
+
+        # ----------------------------
+        # Doctor Sentiment
+        # ----------------------------
+        sentiment = st.radio(
+            "Doctor Sentiment *",
+            ["Positive", "Neutral", "Negative"],
+            horizontal=True,
+            key="dlg_sentiment",
+        )
+
+        # ----------------------------
+        # Mandatory text fields
+        # ----------------------------
+        concern = st.text_area(
+            "Primary Concern *",
+            key="dlg_concern",
+        )
+
+        next_action = st.text_area(
+            "Next Suggested Action *",
+            key="dlg_next_action",
+        )
+
+        # ----------------------------
+        # Optional follow-up date
+        # ----------------------------
+        follow_up_date = None
+        is_follow_up = payload["status"] == "follow_up"
+
+        if is_follow_up:
+              follow_up_date = st.date_input(
+              "Follow Up Date *",
+               key="dlg_follow_up_date",
+            )
+
+
+        # ----------------------------
+        # Validation
+        # ----------------------------
+        is_valid = all([
+            call_status,
+            sentiment,
+            concern and concern.strip(),
+            next_action and next_action.strip(),
+            (follow_up_date if is_follow_up else True),
+        ])
+
+
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+        # ----------------------------
+        # Buttons (bigger)
+        # ----------------------------
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.button(
+                "💾 Save",
+                key="dlg_save",
+                disabled=not is_valid,
+                use_container_width=True,
+                on_click=lambda: _save(
+                    call_status,
+                    sentiment,
+                    concern,
+                    next_action,
+                    follow_up_date,
+                ),
+            )
+
+        with c2:
+            st.button(
+                "✖ Cancel",
+                key="dlg_cancel",
+                use_container_width=True,
+                on_click=_close,
+            )
+
+
+def persist_status_change(payload):
+    with get_connection() as conn:
+        conn.execute(
+            text("""
+            UPDATE work_item
+            SET status = :status,
+                updated_at = NOW()
+            WHERE id = :work_item_id
+            """),
+            payload,
+        )
+
+        conn.execute(
+            text("""
+            INSERT INTO work_item_activity_log (
+                work_item_id,
+                partner_id,
+                external_partner_id,
+                partner_name,
+                agent_id,
+                agent_name,
+                status,
+                doctor_sentiment,
+                primary_concern,
+                next_suggested_action,
+                call_status,
+                follow_up_date
+            )
+            VALUES (
+                :work_item_id,
+                :partner_id,
+                :external_partner_id,
+                :partner_name,
+                :agent_id,
+                :agent_name,
+                :status,
+                :doctor_sentiment,
+                :primary_concern,
+                :next_suggested_action,
+                :call_status,
+                :follow_up_date
+
+            )
+            """),
+            payload,
+        )
+        conn.commit()
 
 # -----------------------------------------------------------------------------
 # UPLOAD DATA
@@ -1144,6 +1333,7 @@ def main():
             st.caption("Not logged in")
 
     st.markdown("# 📊 Central Farming Tool")
+    st.error("🚨 PROD BUILD CHECK: 2026-02-04 19:45 🚨")
 
     if not st.session_state.logged_in:
         render_login()
