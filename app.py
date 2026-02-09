@@ -979,6 +979,7 @@ def render_upload_tab():
                     "PARTNER_TYPE": "partner_type",
                     "PRICE_LIST": "price_list",
                     "PARTNER_TAG": "partner_type_tag",
+                    "ACTIVE_DAYS": "active_days",
 
                     # Monthly metrics
                     "#Orders": "orders",
