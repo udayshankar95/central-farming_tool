@@ -968,23 +968,27 @@ def render_upload_tab():
 
             df = raw_df.rename(
                 columns={
+                    # Partner identifiers
+                    "PARTNER_ID": "external_partner_id",
+                    "PARTNER_NAME": "partner_name",
                     "Partner City": "city",
-                    "Partner ID": "external_partner_id",
-                    "Partner Name": "partner_name",
-                    "Partner Type": "partner_type",
-                    "Price List": "price_list",
+
+                    # Partner metadata
+                    "PARTNER_BD": "partner_bd",
+                    "BD_CAT": "bd_cat",
+                    "PARTNER_TYPE": "partner_type",
+                    "PRICE_LIST": "price_list",
+                    "PARTNER_TAG": "partner_type_tag",
+
+                    # Monthly metrics
                     "#Orders": "orders",
                     "GMV": "gmv",
-                    "Net Revenue": "net_revenue",
+                    "NET_REVENUE": "net_revenue",
                     "Rev/GMV": "rev_per_gmv",
-                    "Channel Share": "channel_share",
-                    "Active Days": "active_days",
-                    # NEW possible columns for tag
-                    "Type": "partner_type_tag",
-                    "Partner Segment": "partner_type_tag",
-                    "Partner Tag": "partner_type_tag",
+                    "CHANNEL_SHARE": "channel_share",
                 }
             )
+
 
             if "external_partner_id" not in df.columns:
                 st.error("Could not find `Partner ID` column to map to external_partner_id.")
