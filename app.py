@@ -8,6 +8,8 @@ import streamlit as st
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.exc import IntegrityError, DBAPIError
+from sqlalchemy.pool import NullPool
+
 
 # -----------------------------------------------------------------------------
 # STREAMLIT CONFIG
@@ -33,11 +35,14 @@ DB_URL = os.getenv(
     ),
 )
 
-engine = create_engine(
-    DB_URL,
-    pool_pre_ping=True,
-    connect_args={"sslmode": "require"},
-)
+@st.cache_resource
+def get_engine():
+    return create_engine(
+        DB_URL,
+        poolclass=NullPool,              # IMPORTANT: disable client-side pooling
+        connect_args={"sslmode": "require"},
+    )
+
 
 # -----------------------------------------------------------------------------
 # WORK ITEM STATUS CONFIG (UPDATED)
@@ -155,11 +160,13 @@ def on_status_change(work_item_id: str):
 
 def get_connection():
     try:
+        engine = get_engine()
         return engine.connect()
     except OperationalError as e:
         st.error("DB connection failed. Check Supabase pooler host/username/password.")
         st.exception(e)
         st.stop()
+
 
 
 def ensure_workitem_columns():
@@ -1338,7 +1345,6 @@ def main():
             st.caption("Not logged in")
 
     st.markdown("# 📊 Central Farming Tool")
-    st.error("🚨 PROD BUILD CHECK: 2026-02-04 19:45 🚨")
 
     if not st.session_state.logged_in:
         render_login()
