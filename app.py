@@ -259,6 +259,25 @@ def reset_work_items_for_agent(agent_id: str) -> int:
 # DATA FETCH
 # -----------------------------------------------------------------------------
 
+def fetch_agent_dashboard_data(start_date, end_date, agent_id=None):
+    q = """
+        SELECT *
+        FROM v_agent_daily_performance
+        WHERE activity_date BETWEEN :start_date AND :end_date
+    """
+
+    params = {
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+    if agent_id:
+        q += " AND agent_id = :agent_id"
+        params["agent_id"] = agent_id
+
+    with get_connection() as conn:
+        return pd.read_sql(text(q), conn, params=params)
+
 def fetch_central_farmers() -> pd.DataFrame:
     q = text(
         """
@@ -1289,6 +1308,63 @@ def render_upload_tab():
 
         st.info("These partners will show on today’s board immediately.")
 
+# Dashboard UI
+def render_agent_dashboard():
+    user = st.session_state.current_user
+
+    st.markdown("### 📊 Agent Performance Dashboard")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        start_date = st.date_input("Start Date")
+
+    with col2:
+        end_date = st.date_input("End Date")
+
+    is_leader = user["role"] != "central_farmer"
+
+    agent_filter = None
+    if is_leader:
+        agent_df = fetch_central_farmers()
+        agent_map = {r["name"]: r["id"] for _, r in agent_df.iterrows()}
+        selected = st.selectbox("Select Agent", ["All"] + list(agent_map.keys()))
+        if selected != "All":
+            agent_filter = agent_map[selected]
+    else:
+        agent_filter = user["id"]
+
+    df = fetch_agent_dashboard_data(start_date, end_date, agent_filter)
+
+    if df.empty:
+        st.info("No activity in selected date range.")
+        return
+
+    # KPI Aggregation
+    total_leads = df["leads_worked"].sum()
+    total_success = df["successful_calls"].sum()
+    total_rnr = df["rnr_calls"].sum()
+    total_followups = df["follow_ups_created"].sum()
+    total_escalations = df["escalations"].sum()
+
+    k1, k2, k3, k4, k5 = st.columns(5)
+
+    k1.metric("Leads Worked", total_leads)
+    k2.metric("Successful Calls", total_success)
+    k3.metric("RNR", total_rnr)
+    k4.metric("Follow Ups", total_followups)
+    k5.metric("Escalations", total_escalations)
+
+    st.divider()
+
+    st.markdown("#### 📈 Daily Trend")
+    st.line_chart(
+        df.groupby("activity_date")["leads_worked"].sum()
+    )
+
+    st.markdown("#### 📋 Detailed Table")
+    st.dataframe(df, use_container_width=True)
+
 
 # -----------------------------------------------------------------------------
 # PORTFOLIO
@@ -1341,6 +1417,7 @@ def main():
                 st.session_state.show_portfolio = False
                 st.session_state.show_feedback_dialog = False
                 st.rerun()
+                
         else:
             st.caption("Not logged in")
 
@@ -1354,13 +1431,16 @@ def main():
         render_portfolio()
         return
 
-    tab_accounts, tab_upload = st.tabs(["Accounts to be Worked", "Upload Data"])
+    tab_accounts, tab_upload, tab_dashboard = st.tabs(["Accounts to be Worked", "Upload Data", "Agent Dashboard"])
 
     with tab_accounts:
         render_board()
 
     with tab_upload:
         render_upload_tab()
+
+    with tab_dashboard:
+        render_agent_dashboard()
 
 
 if __name__ == "__main__":
