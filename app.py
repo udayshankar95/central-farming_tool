@@ -283,7 +283,7 @@ def fetch_central_farmers() -> pd.DataFrame:
         """
         SELECT id, name, email, role
         FROM app_user
-        WHERE role = 'central_farmer'
+        WHERE role IN ('central_farmer', 'manager')
         ORDER BY name;
         """
     )
@@ -956,7 +956,7 @@ def _normalize_partner_type_tag(val):
     return None
 
 
-def render_upload_tab():
+def render_upload_tab(manager_mode=False):
     st.markdown("### Upload Data")
 
     # -------------------------------
@@ -1163,6 +1163,15 @@ def render_upload_tab():
     # -------------------------------
     # B) Add/Map partners to logged-in agent
     # -------------------------------
+    
+    if manager_mode:
+        agent_df = fetch_central_farmers()
+        agent_map = {r["name"]: r["id"] for _, r in agent_df.iterrows()}
+        selected_agent_name = st.selectbox("Assign To Agent", list(agent_map.keys()))
+        selected_agent_id = agent_map[selected_agent_name]
+    else:
+        selected_agent_id = st.session_state.current_user["id"]
+    
     st.subheader("Add / Map Partners to My Account (CSV)")
     st.caption(
         "We will (1) upsert into `partner` by external_partner_id, then (2) create mapping in `partner_agent_map`.\n\n"
@@ -1292,7 +1301,10 @@ def render_upload_tab():
                         ON CONFLICT DO NOTHING;
                         """
                     )
-                    map_res = conn.execute(map_sql, {"partner_id": partner_id, "agent_id": user["id"]})
+                    map_res = conn.execute(map_sql, {
+                      "partner_id": partner_id,
+                      "agent_id": selected_agent_id
+                    })
                     mapped += int(map_res.rowcount or 0)
 
                     conn.commit()
@@ -1366,6 +1378,209 @@ def render_agent_dashboard():
     st.markdown("#### 📋 Detailed Table")
     st.dataframe(df, use_container_width=True)
 
+# Manager Dashboard
+from datetime import timedelta
+
+# -----------------------------------------------------------------------------
+# MANAGER DASHBOARD (Agent Performance)
+# -----------------------------------------------------------------------------
+
+def _fetch_manager_kpis(start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    Returns a single-row dataframe with team-level totals for the selected date range.
+    """
+    q = text("""
+        WITH base AS (
+            SELECT
+                wal.agent_id,
+                wal.agent_name,
+                wal.work_item_id,
+                wal.status,
+                wal.created_at::date AS activity_date
+            FROM work_item_activity_log wal
+            WHERE wal.created_at::date BETWEEN :start_date AND :end_date
+        )
+        SELECT
+            COUNT(DISTINCT work_item_id)                                                AS leads_worked,
+            COUNT(DISTINCT CASE WHEN status = 'successful_call' THEN work_item_id END) AS successful_calls,
+            COUNT(DISTINCT CASE WHEN status IN ('rnr_1','rnr_2','rnr_final') THEN work_item_id END) AS rnr_leads,
+            COUNT(DISTINCT CASE WHEN status = 'follow_up' THEN work_item_id END)       AS follow_ups,
+            COUNT(DISTINCT CASE WHEN status = 'escalated' THEN work_item_id END)       AS escalations,
+            COUNT(DISTINCT CASE WHEN status = 'not_interested' THEN work_item_id END)  AS not_interested,
+            COUNT(DISTINCT agent_id)                                                   AS active_agents
+        FROM base;
+    """)
+    with get_connection() as conn:
+        return pd.read_sql(q, conn, params={"start_date": start_date, "end_date": end_date})
+
+
+def _fetch_manager_daily_trend(start_date: date, end_date: date) -> pd.DataFrame:
+    """
+    Returns daily leads_worked per agent (for trend charts).
+    """
+    q = text("""
+        SELECT
+            wal.created_at::date AS activity_date,
+            wal.agent_id,
+            COALESCE(wal.agent_name, au.name) AS agent_name,
+            COUNT(DISTINCT wal.work_item_id) AS leads_worked
+        FROM work_item_activity_log wal
+        LEFT JOIN app_user au ON au.id = wal.agent_id
+        WHERE wal.created_at::date BETWEEN :start_date AND :end_date
+        GROUP BY wal.created_at::date, wal.agent_id, COALESCE(wal.agent_name, au.name)
+        ORDER BY activity_date, agent_name;
+    """)
+    with get_connection() as conn:
+        return pd.read_sql(q, conn, params={"start_date": start_date, "end_date": end_date})
+
+
+def _fetch_manager_agent_day_table(start_date: date, end_date: date) -> pd.DataFrame:
+
+    q = text("""
+        WITH date_bounds AS (
+            SELECT
+                CAST(:start_date AS DATE) AS start_date,
+                CAST(:end_date AS DATE) AS end_date
+        ),
+        agents AS (
+            SELECT id AS agent_id, name AS agent_name
+            FROM app_user
+            WHERE role = 'central_farmer'
+        ),
+        days AS (
+            SELECT generate_series(
+                (SELECT start_date FROM date_bounds),
+                (SELECT end_date FROM date_bounds),
+                INTERVAL '1 day'
+            )::date AS activity_date
+        ),
+        agg AS (
+            SELECT
+                wal.created_at::date AS activity_date,
+                wal.agent_id,
+                COUNT(DISTINCT wal.work_item_id) AS leads_worked,
+                COUNT(DISTINCT CASE WHEN wal.status = 'successful_call' THEN wal.work_item_id END) AS successful_calls,
+                COUNT(DISTINCT CASE WHEN wal.status IN ('rnr_1','rnr_2','rnr_final') THEN wal.work_item_id END) AS rnr_leads,
+                COUNT(DISTINCT CASE WHEN wal.status = 'follow_up' THEN wal.work_item_id END) AS follow_ups,
+                COUNT(DISTINCT CASE WHEN wal.status = 'escalated' THEN wal.work_item_id END) AS escalations,
+                COUNT(DISTINCT CASE WHEN wal.status = 'not_interested' THEN wal.work_item_id END) AS not_interested
+            FROM work_item_activity_log wal
+            WHERE wal.created_at::date BETWEEN :start_date AND :end_date
+            GROUP BY wal.created_at::date, wal.agent_id
+        )
+        SELECT
+            d.activity_date,
+            a.agent_name,
+            COALESCE(x.leads_worked, 0) AS leads_worked,
+            COALESCE(x.successful_calls, 0) AS successful_calls,
+            COALESCE(x.rnr_leads, 0) AS rnr_leads,
+            COALESCE(x.follow_ups, 0) AS follow_ups,
+            COALESCE(x.escalations, 0) AS escalations,
+            COALESCE(x.not_interested, 0) AS not_interested,
+            CASE
+                WHEN COALESCE(x.leads_worked, 0) = 0 THEN 0
+                ELSE ROUND((COALESCE(x.successful_calls, 0)::numeric / NULLIF(x.leads_worked, 0)) * 100, 2)
+            END AS success_rate_pct,
+            CASE
+                WHEN COALESCE(x.leads_worked, 0) = 0 THEN 0
+                ELSE ROUND((COALESCE(x.rnr_leads, 0)::numeric / NULLIF(x.leads_worked, 0)) * 100, 2)
+            END AS rnr_rate_pct
+        FROM days d
+        CROSS JOIN agents a
+        LEFT JOIN agg x
+            ON x.activity_date = d.activity_date
+           AND x.agent_id = a.agent_id
+        ORDER BY d.activity_date DESC, a.agent_name;
+    """)
+
+    with get_connection() as conn:
+        return pd.read_sql(
+            q,
+            conn,
+            params={"start_date": start_date, "end_date": end_date},
+        )
+
+
+def render_manager_dashboard():
+    """
+    Manager-only view:
+    - Date filter
+    - Team-level KPIs
+    - Daily trend (leads worked split by agent)
+    - Agent x Day table (N agents * D days rows)
+    """
+    user = st.session_state.current_user
+    if not user or user.get("role") != "manager":
+        st.error("Unauthorized")
+        st.stop()
+
+    st.markdown("## 📊 Agent Performance Dashboard")
+
+    # 1) Date filter
+    c1, c2 = st.columns(2)
+    with c1:
+        start_date = st.date_input(
+            "Start date",
+            value=date.today() - timedelta(days=6),
+            key="mgr_start_date",
+        )
+    with c2:
+        end_date = st.date_input(
+            "End date",
+            value=date.today(),
+            key="mgr_end_date",
+        )
+
+    if start_date > end_date:
+        st.error("Start date cannot be after end date.")
+        return
+
+    # 2) KPI summary
+    kpi_df = _fetch_manager_kpis(start_date, end_date)
+    if kpi_df.empty:
+        st.info("No activity found in this date range.")
+        return
+
+    k = kpi_df.iloc[0].to_dict()
+
+    st.markdown("### Summary")
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
+    m1.metric("Leads worked", int(k.get("leads_worked", 0)))
+    m2.metric("Successful calls", int(k.get("successful_calls", 0)))
+    m3.metric("RNR leads", int(k.get("rnr_leads", 0)))
+    m4.metric("Follow-ups", int(k.get("follow_ups", 0)))
+    m5.metric("Escalations", int(k.get("escalations", 0)))
+    m6.metric("Active agents", int(k.get("active_agents", 0)))
+
+    st.divider()
+
+    # 3) Daily trend chart (split by agent)
+    st.markdown("### Daily Trend (Leads Worked by Agent)")
+    trend_df = _fetch_manager_daily_trend(start_date, end_date)
+
+    if trend_df.empty:
+        st.info("No trend data for this date range.")
+    else:
+        # IMPORTANT: ensure x-axis is DATE (not timestamp)
+        trend_df["activity_date"] = pd.to_datetime(trend_df["activity_date"]).dt.date
+        pivot = trend_df.pivot_table(
+            index="activity_date",
+            columns="agent_name",
+            values="leads_worked",
+            aggfunc="sum",
+            fill_value=0,
+        ).sort_index()
+
+        st.line_chart(pivot)  # X axis will now be date-only
+
+    st.divider()
+
+    # 4) Agent x Day table
+    st.markdown("### Agent-Day Table")
+    table_df = _fetch_manager_agent_day_table(start_date, end_date)
+    st.dataframe(table_df, use_container_width=True, hide_index=True)
+
+
 
 # -----------------------------------------------------------------------------
 # PORTFOLIO
@@ -1431,18 +1646,26 @@ def main():
     if st.session_state.show_portfolio:
         render_portfolio()
         return
+    user = st.session_state.current_user
 
-    tab_accounts, tab_upload, tab_dashboard = st.tabs(["Accounts to be Worked", "Upload Data", "Agent Dashboard"])
+    if user["role"] == "central_farmer":
+        tab_accounts, tab_upload, tab_dashboard = st.tabs(["Accounts to be Worked", "Upload Data", "Agent Dashboard"])
 
-    with tab_accounts:
-        render_board()
+        with tab_accounts:
+            render_board()
 
-    with tab_upload:
-        render_upload_tab()
+        with tab_upload:
+            render_upload_tab()
 
-    with tab_dashboard:
-        render_agent_dashboard()
+        with tab_dashboard:
+            render_agent_dashboard()
 
+    elif user["role"] == "manager":
+        tab_dashboard, tab_upload = st.tabs(["Agent Dashboard" , "Upload Data"])
+        
+        with tab_upload:render_upload_tab(manager_mode=True)
+
+        with tab_dashboard:render_manager_dashboard()
 
 if __name__ == "__main__":
     main()
