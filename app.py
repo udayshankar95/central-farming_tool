@@ -1358,6 +1358,7 @@ def render_agent_dashboard():
     st.divider()
 
     st.markdown("#### 📈 Daily Trend")
+    df["activity_date"] = pd.to_datetime(df["activity_date"]).dt.date
     st.line_chart(
         df.groupby("activity_date")["leads_worked"].sum()
     )
